@@ -10,15 +10,14 @@ import re
 INPUT_PATH = Path("data/processed/dih_preprocessed.json")
 OUTPUT_PATH = Path("data/processed/dih_chunks.json")
 
-# Target ukuran chunk dalam karakter.
-# Nantinya akan kita evaluasi lagi berdasarkan hasil chunking.
+# Target ukuran chunk dalam karakter
 CHUNK_SIZE = 3000
 
-# Overlap antar-chunk dalam karakter.
+# Overlap antar chunk
 CHUNK_OVERLAP = 500
 
-# Minimum karakter agar chunk dianggap valid.
-MIN_CHUNK_SIZE = 300
+# Chunk terlalu kecil akan digabung dengan chunk berikutnya
+MIN_CHUNK_SIZE = 500
 
 
 # ============================================================
@@ -27,475 +26,756 @@ MIN_CHUNK_SIZE = 300
 
 def normalize_text(text: str) -> str:
     """
-    Membersihkan whitespace tambahan tanpa mengubah
-    isi klinis dari teks.
+    Membersihkan whitespace ringan tanpa mengubah isi klinis.
     """
-    if not text:
-        return ""
-
     text = text.replace("\r\n", "\n")
     text = text.replace("\r", "\n")
 
-    # Spasi/tab berulang
+    # Hilangkan spasi berlebih
     text = re.sub(r"[ \t]+", " ", text)
 
-    # Baris kosong berlebihan
+    # Rapikan newline
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
 
-def split_text_into_units(text: str) -> list[str]:
+def split_long_text(text: str, max_length: int) -> list[str]:
     """
-    Memecah teks menjadi unit yang relatif aman untuk digabungkan.
+    Membagi block yang sangat panjang menjadi beberapa bagian.
 
-    Prioritas:
-    1. Paragraf
-    2. Baris
-    3. Kalimat
+    Prioritas pemotongan:
+    1. paragraf
+    2. kalimat
+    3. spasi
+    4. hard cut jika memang diperlukan
     """
     text = normalize_text(text)
 
-    if not text:
-        return []
-
-    # Pertahankan paragraf sebagai unit utama
-    paragraphs = re.split(r"\n\s*\n", text)
-
-    units = []
-
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-
-        if not paragraph:
-            continue
-
-        # Jika paragraf terlalu panjang, pecah berdasarkan baris.
-        if len(paragraph) > CHUNK_SIZE:
-            lines = [
-                line.strip()
-                for line in paragraph.split("\n")
-                if line.strip()
-            ]
-
-            for line in lines:
-                if line:
-                    units.append(line)
-        else:
-            units.append(paragraph)
-
-    return units
-
-
-def split_long_text(text: str, max_size: int) -> list[str]:
-    """
-    Memecah teks yang masih terlalu panjang.
-    Pemotongan dilakukan berdasarkan spasi agar tidak
-    memotong kata di tengah.
-    """
-    words = text.split()
-
-    if not words:
-        return []
+    if len(text) <= max_length:
+        return [text]
 
     parts = []
-    current = []
 
-    current_length = 0
+    remaining = text
 
-    for word in words:
-        additional_length = len(word)
+    while len(remaining) > max_length:
+        candidate = remaining[:max_length]
 
-        if current:
-            additional_length += 1
+        # Prioritas 1: newline
+        split_position = candidate.rfind("\n\n")
 
-        if (
-            current
-            and current_length + additional_length > max_size
-        ):
-            parts.append(" ".join(current))
-            current = [word]
-            current_length = len(word)
-        else:
-            current.append(word)
-            current_length += additional_length
+        # Prioritas 2: akhir kalimat
+        if split_position < max_length * 0.5:
+            sentence_positions = [
+                candidate.rfind(". "),
+                candidate.rfind("; "),
+                candidate.rfind(": "),
+            ]
+            sentence_positions = [
+                pos for pos in sentence_positions
+                if pos >= int(max_length * 0.5)
+            ]
 
-    if current:
-        parts.append(" ".join(current))
+            if sentence_positions:
+                split_position = max(sentence_positions)
+
+        # Prioritas 3: spasi
+        if split_position < int(max_length * 0.5):
+            split_position = candidate.rfind(" ")
+
+        # Fallback
+        if split_position < int(max_length * 0.5):
+            split_position = max_length
+
+        part = remaining[:split_position].strip()
+
+        if part:
+            parts.append(part)
+
+        remaining = remaining[split_position:].strip()
+
+    if remaining:
+        parts.append(remaining)
 
     return parts
 
 
 # ============================================================
-# BLOCK HANDLING
+# STRUCTURAL BOUNDARY DETECTION
 # ============================================================
 
-def get_page_blocks(page: dict) -> list[dict]:
+def is_probable_entry_heading(text: str) -> bool:
     """
-    Mengambil ordered_blocks dari satu halaman.
+    Mendeteksi block yang secara STRUKTURAL terlihat seperti
+    heading/awal entri.
 
-    ordered_blocks sudah merupakan hasil preprocessing:
-    left column → right column.
+    Penting:
+    Fungsi ini TIDAK mencoba mengenali nama obat berdasarkan
+    database eksternal atau menebak nama obat.
 
-    Sequence tetap dipertahankan sebagai metadata.
+    Yang diperiksa hanya karakteristik format:
+    - satu baris
+    - relatif pendek
+    - dominan huruf kapital
+    - tidak terlihat seperti kalimat biasa
+    - tidak berakhir dengan tanda baca kalimat
+
+    Tujuannya hanya mencegah chunk memotong heading penting.
     """
-    blocks = page.get("ordered_blocks", [])
 
-    valid_blocks = []
+    text = normalize_text(text)
 
-    for block in blocks:
-        text = normalize_text(block.get("text", ""))
+    if not text:
+        return False
 
-        if not text:
+    # Jangan perlakukan block panjang sebagai heading
+    if len(text) > 120:
+        return False
+
+    # Heading biasanya hanya satu baris
+    if "\n" in text:
+        return False
+
+    # Hindari angka panjang / dosis
+    if len(re.findall(r"\d", text)) > 4:
+        return False
+
+    # Harus memiliki huruf
+    letters = re.findall(r"[A-Za-z]", text)
+
+    if len(letters) < 3:
+        return False
+
+    # Rasio huruf kapital
+    uppercase_letters = [
+        char for char in letters
+        if char.isupper()
+    ]
+
+    uppercase_ratio = len(uppercase_letters) / len(letters)
+
+    if uppercase_ratio < 0.75:
+        return False
+
+    # Jangan anggap label umum sebagai entry heading
+    excluded = {
+        "WARNING",
+        "WARNINGS",
+        "PRECAUTIONS",
+        "CONTRAINDICATIONS",
+        "ADVERSE EFFECTS",
+        "DRUG INTERACTIONS",
+        "INTERACTIONS",
+        "PHARMACOLOGY",
+        "PHARMACOKINETICS",
+        "DOSAGE",
+        "DOSAGE FORMS",
+        "DESCRIPTION",
+        "INDICATIONS",
+        "CLINICAL EFFECTS",
+        "MECHANISM",
+        "REFERENCES",
+        "INDEX",
+        "INTRODUCTION",
+        "TABLE OF CONTENTS",
+    }
+
+    normalized = re.sub(r"\s+", " ", text).strip().upper()
+
+    if normalized in excluded:
+        return False
+
+    # Heading tidak biasanya diakhiri tanda baca
+    if text.endswith((".", ",", ";", ":")):
+        return False
+
+    return True
+
+
+# ============================================================
+# BLOCK REPRESENTATION
+# ============================================================
+
+def prepare_units(page: dict) -> list[dict]:
+    """
+    Mengubah ordered_blocks menjadi unit-unit chunking.
+
+    Satu block normal = satu unit.
+
+    Jika block terlalu panjang, block dipecah menjadi beberapa unit.
+    """
+
+    ordered_blocks = page.get("ordered_blocks", [])
+
+    units = []
+
+    for block in ordered_blocks:
+        original_text = normalize_text(block.get("text", ""))
+
+        if not original_text:
             continue
 
-        valid_blocks.append(
-            {
+        pieces = split_long_text(
+            original_text,
+            CHUNK_SIZE,
+        )
+
+        for piece_index, piece in enumerate(pieces):
+            unit = {
+                "text": piece,
                 "pdf_page": page.get("pdf_page"),
-                "block_id": block.get("block_id"),
-                "bbox": block.get("bbox"),
                 "sequence": block.get("sequence"),
+                "block_id": block.get("block_id"),
                 "column": block.get("column"),
-                "text": text,
+                "piece_index": piece_index,
+                "original_block_length": len(original_text),
             }
-        )
 
-    return valid_blocks
+            units.append(unit)
 
-
-def collect_blocks(data: list[dict]) -> list[dict]:
-    """
-    Menggabungkan seluruh block dari seluruh halaman
-    berdasarkan sequence global.
-
-    Tidak menggabungkan konteks drug secara otomatis.
-    """
-    all_blocks = []
-
-    for page in data:
-        page_blocks = get_page_blocks(page)
-        all_blocks.extend(page_blocks)
-
-    # Pastikan urutan berdasarkan sequence
-    all_blocks.sort(
-        key=lambda block: (
-            block["sequence"]
-            if block["sequence"] is not None
-            else float("inf")
-        )
-    )
-
-    return all_blocks
+    return units
 
 
 # ============================================================
 # CHUNK CREATION
 # ============================================================
 
-def create_chunk(
-    blocks: list[dict],
-    text: str,
+def build_chunk(
+    units: list[dict],
     chunk_number: int,
+    overlap_from: str | None = None,
 ) -> dict:
     """
-    Membuat satu objek chunk dengan metadata lengkap.
+    Membuat satu object chunk.
     """
 
+    texts = [
+        unit["text"]
+        for unit in units
+        if unit["text"]
+    ]
+
+    text = "\n\n".join(texts).strip()
+
     pages = [
-        block["pdf_page"]
-        for block in blocks
-        if block["pdf_page"] is not None
+        unit["pdf_page"]
+        for unit in units
+        if unit["pdf_page"] is not None
     ]
 
     sequences = [
-        block["sequence"]
-        for block in blocks
-        if block["sequence"] is not None
+        unit["sequence"]
+        for unit in units
+        if unit["sequence"] is not None
     ]
 
     block_ids = [
-        block["block_id"]
-        for block in blocks
-        if block["block_id"] is not None
+        unit["block_id"]
+        for unit in units
+        if unit["block_id"] is not None
     ]
 
-    columns = []
+    columns = list(
+        dict.fromkeys(
+            unit["column"]
+            for unit in units
+            if unit["column"] is not None
+        )
+    )
 
-    for block in blocks:
-        column = block.get("column")
-
-        if column and column not in columns:
-            columns.append(column)
-
-    return {
+    chunk = {
         "chunk_id": f"dih_chunk_{chunk_number:06d}",
-
         "text": text,
-
         "metadata": {
             "pdf_page_start": min(pages) if pages else None,
             "pdf_page_end": max(pages) if pages else None,
-
             "sequence_start": min(sequences) if sequences else None,
             "sequence_end": max(sequences) if sequences else None,
-
             "block_ids": block_ids,
-
             "columns": columns,
-
             "character_count": len(text),
-
             "source": "Drug Interaction Handbook",
             "source_type": "book",
         },
     }
 
+    if overlap_from is not None:
+        chunk["metadata"]["overlap_from"] = overlap_from
 
-def create_chunks(blocks: list[dict]) -> list[dict]:
-    """
-    Membuat chunk dari block secara berurutan.
+    return chunk
 
-    Prinsip:
-    - Block tidak dipisahkan secara sembarangan.
-    - Chunk dibentuk hingga mendekati CHUNK_SIZE.
-    - Chunk yang terlalu panjang dipecah berdasarkan kata.
-    - Overlap dibuat menggunakan teks dari chunk sebelumnya.
+
+def get_overlap_units(
+    units: list[dict],
+    overlap_size: int,
+) -> list[dict]:
     """
+    Mengambil unit dari bagian akhir chunk untuk overlap.
+
+    Overlap dihitung berdasarkan karakter, tetapi unit/block
+    tetap dipertahankan utuh selama memungkinkan.
+    """
+
+    if not units:
+        return []
+
+    selected = []
+    current_length = 0
+
+    for unit in reversed(units):
+        unit_length = len(unit["text"])
+
+        if selected and current_length + unit_length > overlap_size:
+            break
+
+        selected.insert(0, unit)
+        current_length += unit_length
+
+        if current_length >= overlap_size:
+            break
+
+    return selected
+
+
+def create_chunks_from_page(
+    page: dict,
+    chunk_number_start: int,
+) -> tuple[list[dict], int]:
+    """
+    Membuat chunk dari satu halaman.
+
+    Chunk tidak dipaksa berhenti di akhir halaman.
+    Namun setiap block dipertahankan sebagai unit.
+    """
+
+    units = prepare_units(page)
+
+    if not units:
+        return [], chunk_number_start
 
     chunks = []
 
-    current_blocks = []
     current_units = []
     current_length = 0
 
-    chunk_number = 1
+    chunk_number = chunk_number_start
 
-    for block in blocks:
+    for unit in units:
+        unit_length = len(unit["text"])
 
-        block_text = block["text"]
-
-        units = split_text_into_units(block_text)
-
-        if not units:
-            continue
-
-        for unit in units:
-
-            # Jika satu unit terlalu panjang,
-            # pecah terlebih dahulu.
-            if len(unit) > CHUNK_SIZE:
-
-                long_parts = split_long_text(
-                    unit,
-                    CHUNK_SIZE,
-                )
-
-                for part in long_parts:
-
-                    if current_units:
-                        candidate_length = (
-                            current_length
-                            + len(part)
-                            + 2
-                        )
-                    else:
-                        candidate_length = len(part)
-
-                    if (
-                        current_units
-                        and candidate_length > CHUNK_SIZE
-                    ):
-                        chunk_text = "\n\n".join(
-                            current_units
-                        )
-
-                        chunks.append(
-                            create_chunk(
-                                blocks=current_blocks,
-                                text=chunk_text,
-                                chunk_number=chunk_number,
-                            )
-                        )
-
-                        chunk_number += 1
-
-                        # Buat overlap dari akhir chunk
-                        overlap_text = build_overlap(
-                            current_units
-                        )
-
-                        current_units = (
-                            [overlap_text]
-                            if overlap_text
-                            else []
-                        )
-
-                        current_blocks = (
-                            current_blocks[-1:]
-                            if overlap_text
-                            else []
-                        )
-
-                        current_length = (
-                            len(overlap_text)
-                            if overlap_text
-                            else 0
-                        )
-
-                    current_units.append(part)
-
-                    current_length = (
-                        sum(len(item) for item in current_units)
-                        + 2 * (len(current_units) - 1)
-                    )
-
-                continue
-
-            # Kandidat chunk berikutnya
-            separator_length = 2 if current_units else 0
-
-            candidate_length = (
-                current_length
-                + separator_length
-                + len(unit)
-            )
-
-            if (
-                current_units
-                and candidate_length > CHUNK_SIZE
-            ):
-                chunk_text = "\n\n".join(
-                    current_units
-                )
-
-                chunks.append(
-                    create_chunk(
-                        blocks=current_blocks,
-                        text=chunk_text,
-                        chunk_number=chunk_number,
-                    )
-                )
-
+        # ----------------------------------------------------
+        # Jika unit sendiri lebih besar dari target
+        # ----------------------------------------------------
+        if unit_length > CHUNK_SIZE:
+            if current_units:
                 chunk_number += 1
 
-                # Ambil overlap dari chunk sebelumnya
-                overlap_text = build_overlap(
-                    current_units
+                chunk = build_chunk(
+                    current_units,
+                    chunk_number,
                 )
 
-                current_units = (
-                    [overlap_text]
-                    if overlap_text
-                    else []
-                )
+                chunks.append(chunk)
 
-                current_blocks = (
-                    current_blocks[-1:]
-                    if overlap_text
-                    else []
-                )
+                current_units = []
+                current_length = 0
 
-                current_length = (
-                    len(overlap_text)
-                    if overlap_text
-                    else 0
-                )
+            chunk_number += 1
 
-            current_units.append(unit)
-
-            if block not in current_blocks:
-                current_blocks.append(block)
-
-            current_length = (
-                sum(len(item) for item in current_units)
-                + 2 * (len(current_units) - 1)
+            chunk = build_chunk(
+                [unit],
+                chunk_number,
             )
 
-    # Simpan chunk terakhir
-    if current_units:
+            chunks.append(chunk)
 
-        chunk_text = "\n\n".join(
-            current_units
+            continue
+
+        # ----------------------------------------------------
+        # Apakah unit akan membuat chunk terlalu besar?
+        # ----------------------------------------------------
+        would_exceed = (
+            current_length > 0
+            and current_length + unit_length + 2 > CHUNK_SIZE
         )
 
-        if len(chunk_text) >= MIN_CHUNK_SIZE:
-            chunks.append(
-                create_chunk(
-                    blocks=current_blocks,
-                    text=chunk_text,
-                    chunk_number=chunk_number,
-                )
+        if would_exceed:
+
+            # Simpan chunk sekarang
+            chunk_number += 1
+
+            previous_chunk_id = (
+                f"dih_chunk_{chunk_number:06d}"
             )
+
+            chunk = build_chunk(
+                current_units,
+                chunk_number,
+            )
+
+            chunks.append(chunk)
+
+            # Ambil overlap
+            overlap_units = get_overlap_units(
+                current_units,
+                CHUNK_OVERLAP,
+            )
+
+            current_units = overlap_units + [unit]
+
+            current_length = sum(
+                len(item["text"]) + 2
+                for item in current_units
+            )
+
+            # Update metadata overlap
+            if chunks:
+                chunks[-1]["metadata"]["has_overlap_to_next"] = bool(
+                    overlap_units
+                )
+
+            # Catat sumber overlap pada chunk baru nanti
+            pending_overlap_from = previous_chunk_id
+
+            continue
+
+        # ----------------------------------------------------
+        # Tambahkan unit ke chunk sekarang
+        # ----------------------------------------------------
+        current_units.append(unit)
+
+        current_length += unit_length
+
+        if len(current_units) > 1:
+            current_length += 2
+
+    # --------------------------------------------------------
+    # Simpan chunk terakhir
+    # --------------------------------------------------------
+    if current_units:
+        chunk_number += 1
+
+        chunk = build_chunk(
+            current_units,
+            chunk_number,
+        )
+
+        chunks.append(chunk)
+
+    return chunks, chunk_number
+
+
+# ============================================================
+# GLOBAL CHUNKING
+# ============================================================
+
+def create_chunks(data: list[dict]) -> list[dict]:
+    """
+    Membuat chunk berdasarkan seluruh dokumen.
+
+    Chunking tetap berjalan mengikuti sequence global.
+    """
+
+    all_units = []
+
+    for page in data:
+        units = prepare_units(page)
+
+        if units:
+            all_units.extend(units)
+
+    if not all_units:
+        return []
+
+    # Pastikan urutan global benar
+    all_units.sort(
+        key=lambda unit: (
+            unit["sequence"]
+            if unit["sequence"] is not None
+            else 999999999
+        )
+    )
+
+    chunks = []
+
+    current_units = []
+    current_length = 0
+
+    chunk_number = 0
+    previous_chunk_id = None
+
+    for unit in all_units:
+
+        unit_length = len(unit["text"])
+
+        # ----------------------------------------------------
+        # Unit sangat panjang
+        # ----------------------------------------------------
+        if unit_length > CHUNK_SIZE:
+
+            if current_units:
+                chunk_number += 1
+
+                chunk = build_chunk(
+                    current_units,
+                    chunk_number,
+                )
+
+                chunks.append(chunk)
+
+                previous_chunk_id = chunk["chunk_id"]
+
+                overlap_units = get_overlap_units(
+                    current_units,
+                    CHUNK_OVERLAP,
+                )
+
+                current_units = overlap_units
+
+                current_length = sum(
+                    len(item["text"]) + 2
+                    for item in current_units
+                )
+
+            # Unit panjang sudah dipecah oleh prepare_units,
+            # sehingga seharusnya tidak sering masuk ke sini.
+            current_units.append(unit)
+
+            current_length += unit_length
+
+            continue
+
+        # ----------------------------------------------------
+        # Cek structural heading
+        # ----------------------------------------------------
+        is_heading = is_probable_entry_heading(
+            unit["text"]
+        )
+
+        # ----------------------------------------------------
+        # Jika heading baru muncul dan chunk sebelumnya
+        # sudah cukup besar, tutup chunk sebelum heading.
+        #
+        # Ini membantu mencegah satu chunk mencampurkan
+        # bagian akhir satu entri dengan awal entri berikutnya.
+        # ----------------------------------------------------
+        if (
+            is_heading
+            and current_units
+            and current_length >= MIN_CHUNK_SIZE
+        ):
+            chunk_number += 1
+
+            chunk = build_chunk(
+                current_units,
+                chunk_number,
+            )
+
+            chunks.append(chunk)
+
+            previous_chunk_id = chunk["chunk_id"]
+
+            overlap_units = get_overlap_units(
+                current_units,
+                CHUNK_OVERLAP,
+            )
+
+            # Jangan membawa heading sebelumnya ke chunk baru.
+            # Overlap hanya digunakan dari unit sebelum heading.
+            current_units = overlap_units
+
+            current_length = sum(
+                len(item["text"]) + 2
+                for item in current_units
+            )
+
+        # ----------------------------------------------------
+        # Jika penambahan unit membuat chunk terlalu besar
+        # ----------------------------------------------------
+        would_exceed = (
+            current_length > 0
+            and current_length + unit_length + 2 > CHUNK_SIZE
+        )
+
+        if would_exceed:
+
+            chunk_number += 1
+
+            chunk = build_chunk(
+                current_units,
+                chunk_number,
+            )
+
+            chunks.append(chunk)
+
+            previous_chunk_id = chunk["chunk_id"]
+
+            overlap_units = get_overlap_units(
+                current_units,
+                CHUNK_OVERLAP,
+            )
+
+            current_units = overlap_units + [unit]
+
+            current_length = sum(
+                len(item["text"]) + 2
+                for item in current_units
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Tambahkan unit
+        # ----------------------------------------------------
+        current_units.append(unit)
+
+        current_length += unit_length
+
+        if len(current_units) > 1:
+            current_length += 2
+
+    # --------------------------------------------------------
+    # Chunk terakhir
+    # --------------------------------------------------------
+    if current_units:
+
+        chunk_number += 1
+
+        chunk = build_chunk(
+            current_units,
+            chunk_number,
+        )
+
+        chunks.append(chunk)
 
     return chunks
 
 
 # ============================================================
-# OVERLAP
+# POST PROCESSING
 # ============================================================
 
-def build_overlap(units: list[str]) -> str:
+def merge_tiny_chunks(chunks: list[dict]) -> list[dict]:
     """
-    Mengambil bagian akhir chunk untuk overlap.
+    Menggabungkan chunk yang sangat kecil dengan chunk berikutnya
+    jika memungkinkan.
 
-    Overlap dibatasi sekitar CHUNK_OVERLAP karakter.
+    Tidak dilakukan jika hasil penggabungan akan terlalu besar.
     """
-    if not units:
-        return ""
 
-    selected = []
-    total_length = 0
+    if not chunks:
+        return []
 
-    for unit in reversed(units):
+    result = []
 
-        additional_length = (
-            len(unit)
-            + (2 if selected else 0)
-        )
+    index = 0
+
+    while index < len(chunks):
+
+        current = chunks[index]
 
         if (
-            selected
-            and total_length + additional_length
-            > CHUNK_OVERLAP
+            current["metadata"]["character_count"] < MIN_CHUNK_SIZE
+            and index + 1 < len(chunks)
         ):
-            break
+            next_chunk = chunks[index + 1]
 
-        selected.insert(0, unit)
-        total_length += additional_length
+            combined_text = (
+                current["text"]
+                + "\n\n"
+                + next_chunk["text"]
+            )
 
-    return "\n\n".join(selected)
+            if len(combined_text) <= CHUNK_SIZE * 1.15:
+
+                merged = {
+                    "chunk_id": next_chunk["chunk_id"],
+                    "text": combined_text,
+                    "metadata": {
+                        "pdf_page_start": min(
+                            current["metadata"]["pdf_page_start"],
+                            next_chunk["metadata"]["pdf_page_start"],
+                        ),
+                        "pdf_page_end": max(
+                            current["metadata"]["pdf_page_end"],
+                            next_chunk["metadata"]["pdf_page_end"],
+                        ),
+                        "sequence_start": min(
+                            current["metadata"]["sequence_start"],
+                            next_chunk["metadata"]["sequence_start"],
+                        ),
+                        "sequence_end": max(
+                            current["metadata"]["sequence_end"],
+                            next_chunk["metadata"]["sequence_end"],
+                        ),
+                        "block_ids": (
+                            current["metadata"]["block_ids"]
+                            + next_chunk["metadata"]["block_ids"]
+                        ),
+                        "columns": list(
+                            dict.fromkeys(
+                                current["metadata"]["columns"]
+                                + next_chunk["metadata"]["columns"]
+                            )
+                        ),
+                        "character_count": len(combined_text),
+                        "source": "Drug Interaction Handbook",
+                        "source_type": "book",
+                    },
+                }
+
+                result.append(merged)
+                index += 2
+                continue
+
+        result.append(current)
+        index += 1
+
+    return result
+
+
+def renumber_chunks(chunks: list[dict]) -> list[dict]:
+    """
+    Menjamin chunk_id berurutan setelah post-processing.
+    """
+
+    for index, chunk in enumerate(chunks, start=1):
+        chunk["chunk_id"] = f"dih_chunk_{index:06d}"
+
+    return chunks
 
 
 # ============================================================
 # STATISTICS
 # ============================================================
 
-def calculate_statistics(
-    chunks: list[dict],
-) -> dict:
-
+def calculate_statistics(chunks: list[dict]) -> dict:
     if not chunks:
         return {
             "total_chunks": 0,
             "total_characters": 0,
             "average_characters": 0,
-            "minimum_characters": 0,
-            "maximum_characters": 0,
+            "min_characters": 0,
+            "max_characters": 0,
         }
 
-    lengths = [
-        len(chunk["text"])
+    character_counts = [
+        chunk["metadata"]["character_count"]
         for chunk in chunks
     ]
 
     return {
         "total_chunks": len(chunks),
-        "total_characters": sum(lengths),
+        "total_characters": sum(character_counts),
         "average_characters": round(
-            sum(lengths) / len(lengths)
+            sum(character_counts) / len(character_counts),
+            2,
         ),
-        "minimum_characters": min(lengths),
-        "maximum_characters": max(lengths),
+        "min_characters": min(character_counts),
+        "max_characters": max(character_counts),
     }
 
 
@@ -509,31 +789,85 @@ def print_statistics(chunks: list[dict]) -> None:
     print("=" * 60)
 
     print(
-        f"Total chunk          : "
+        f"Total chunk        : "
         f"{stats['total_chunks']:,}"
     )
 
     print(
-        f"Total karakter       : "
+        f"Total karakter     : "
         f"{stats['total_characters']:,}"
     )
 
     print(
-        f"Rata-rata karakter   : "
+        f"Rata-rata karakter : "
         f"{stats['average_characters']:,}"
     )
 
     print(
-        f"Minimum karakter     : "
-        f"{stats['minimum_characters']:,}"
+        f"Minimum karakter   : "
+        f"{stats['min_characters']:,}"
     )
 
     print(
-        f"Maximum karakter     : "
-        f"{stats['maximum_characters']:,}"
+        f"Maksimum karakter  : "
+        f"{stats['max_characters']:,}"
     )
 
     print("=" * 60)
+
+
+# ============================================================
+# PREVIEW
+# ============================================================
+
+def print_preview(chunks: list[dict], count: int = 3) -> None:
+
+    print()
+    print("=" * 60)
+    print(f"PREVIEW {min(count, len(chunks))} CHUNK")
+    print("=" * 60)
+
+    for chunk in chunks[:count]:
+
+        metadata = chunk["metadata"]
+
+        print()
+        print("-" * 60)
+
+        print(
+            f"Chunk ID     : "
+            f"{chunk['chunk_id']}"
+        )
+
+        print(
+            f"Halaman      : "
+            f"{metadata['pdf_page_start']} - "
+            f"{metadata['pdf_page_end']}"
+        )
+
+        print(
+            f"Sequence     : "
+            f"{metadata['sequence_start']} - "
+            f"{metadata['sequence_end']}"
+        )
+
+        print(
+            f"Karakter     : "
+            f"{metadata['character_count']}"
+        )
+
+        print(
+            f"Kolom        : "
+            f"{', '.join(metadata['columns'])}"
+        )
+
+        preview = chunk["text"][:800]
+
+        print()
+        print(preview)
+
+        if len(chunk["text"]) > 800:
+            print("...")
 
 
 # ============================================================
@@ -564,60 +898,6 @@ def save_chunks(
 
 
 # ============================================================
-# PREVIEW
-# ============================================================
-
-def print_preview(
-    chunks: list[dict],
-    number: int = 3,
-) -> None:
-
-    print()
-    print("=" * 60)
-    print("PREVIEW CHUNK")
-    print("=" * 60)
-
-    for chunk in chunks[:number]:
-
-        metadata = chunk["metadata"]
-
-        print()
-        print(
-            f"Chunk ID       : "
-            f"{chunk['chunk_id']}"
-        )
-
-        print(
-            f"Halaman        : "
-            f"{metadata['pdf_page_start']} - "
-            f"{metadata['pdf_page_end']}"
-        )
-
-        print(
-            f"Sequence       : "
-            f"{metadata['sequence_start']} - "
-            f"{metadata['sequence_end']}"
-        )
-
-        print(
-            f"Jumlah karakter : "
-            f"{metadata['character_count']}"
-        )
-
-        print("-" * 60)
-
-        preview = chunk["text"]
-
-        if len(preview) > 800:
-            preview = preview[:800] + "..."
-
-        print(preview)
-
-    print()
-    print("=" * 60)
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
@@ -627,29 +907,38 @@ def main():
     print("CHUNKING DIH")
     print("=" * 60)
 
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(
-            "File input tidak ditemukan:\n"
-            f"{INPUT_PATH.resolve()}"
-        )
-
     print(
         f"Input : "
         f"{INPUT_PATH.resolve()}"
     )
 
     print(
-        f"Chunk size : "
-        f"{CHUNK_SIZE} karakter"
+        f"Output: "
+        f"{OUTPUT_PATH.resolve()}"
     )
 
     print(
-        f"Overlap    : "
-        f"{CHUNK_OVERLAP} karakter"
+        f"Chunk size    : "
+        f"{CHUNK_SIZE}"
+    )
+
+    print(
+        f"Chunk overlap  : "
+        f"{CHUNK_OVERLAP}"
     )
 
     # --------------------------------------------------------
-    # LOAD
+    # Check input
+    # --------------------------------------------------------
+
+    if not INPUT_PATH.exists():
+        raise FileNotFoundError(
+            "File input tidak ditemukan:\n"
+            f"{INPUT_PATH.resolve()}"
+        )
+
+    # --------------------------------------------------------
+    # Load data
     # --------------------------------------------------------
 
     with INPUT_PATH.open(
@@ -659,35 +948,46 @@ def main():
 
         data = json.load(file)
 
+    if not isinstance(data, list):
+        raise ValueError(
+            "Format dih_preprocessed.json "
+            "harus berupa list."
+        )
+
+    print()
     print(
-        f"Jumlah halaman input : "
+        f"Jumlah halaman input: "
         f"{len(data):,}"
     )
 
     # --------------------------------------------------------
-    # COLLECT BLOCKS
+    # Create chunks
     # --------------------------------------------------------
 
-    blocks = collect_blocks(data)
+    print()
+    print("Membuat chunk...")
+
+    chunks = create_chunks(data)
 
     print(
-        f"Total block           : "
-        f"{len(blocks):,}"
-    )
-
-    # --------------------------------------------------------
-    # CREATE CHUNKS
-    # --------------------------------------------------------
-
-    chunks = create_chunks(blocks)
-
-    print(
-        f"Total chunk           : "
+        f"Chunk awal: "
         f"{len(chunks):,}"
     )
 
     # --------------------------------------------------------
-    # SAVE
+    # Merge tiny chunks
+    # --------------------------------------------------------
+
+    chunks = merge_tiny_chunks(chunks)
+
+    # --------------------------------------------------------
+    # Renumber
+    # --------------------------------------------------------
+
+    chunks = renumber_chunks(chunks)
+
+    # --------------------------------------------------------
+    # Save
     # --------------------------------------------------------
 
     save_chunks(
@@ -696,26 +996,24 @@ def main():
     )
 
     # --------------------------------------------------------
-    # STATISTICS
+    # Statistics
     # --------------------------------------------------------
 
     print_statistics(chunks)
 
-    # --------------------------------------------------------
-    # PREVIEW
-    # --------------------------------------------------------
-
     print_preview(
         chunks,
-        number=3,
+        count=3,
     )
 
     print()
+    print("=" * 60)
+    print("SELESAI")
+    print("=" * 60)
+
     print(
-        "Output:"
-    )
-    print(
-        OUTPUT_PATH.resolve()
+        f"Output tersimpan di:\n"
+        f"{OUTPUT_PATH.resolve()}"
     )
 
 
